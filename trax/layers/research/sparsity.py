@@ -19,6 +19,7 @@
 import functools
 import math
 import random as pyrandom
+from jax import random
 import numpy as np
 
 from trax import fastmath
@@ -743,6 +744,117 @@ def MultiplicativeConvCausalAttention(
   )
 
 
+class NonnegativeSoftmaxKernelFeatureCreator():
+  """Generator for approximate softmax orthogonal kernel feature matrices.
+
+    Attributes:
+      nb_rows: Number of rows.
+      nb_columns: Number of columns.
+      scaling: Scaling attribute, 0 or 1.
+      normalize_data: predicate indicating whether data should be normalized.
+      eps: numerical stabilizer.
+  """
+
+  def __init__(self, nb_rows=256, nb_columns=0, scaling=0, normalize_data=False,
+               eps=0.0001):
+    rng = random.PRNGKey(0)
+    matrixrng, _ = random.split(rng)
+    self.key = matrixrng
+    self.nb_rows = nb_rows
+    self.nb_columns = nb_columns
+    self.scaling = scaling
+    self.normalize_data = normalize_data
+    self.eps = eps
+    self.projection_matrix = self.get_2d_array()
+
+  def get_2d_array(self):
+    """Generates the random orthogonal matrix."""
+    nb_full_blocks = int(self.nb_rows / self.nb_columns)
+    block_list = []
+    rng = self.key
+    for _ in range(nb_full_blocks):
+      rng, rng_input = random.split(rng)
+      unstructured_block = random.normal(rng_input,
+                                         (self.nb_columns, self.nb_columns))
+      q, _ = jnp.linalg.qr(unstructured_block)
+      q = jnp.transpose(q)
+      block_list.append(q)
+    remaining_rows = self.nb_rows - nb_full_blocks * self.nb_columns
+    if remaining_rows > 0:
+      rng, rng_input = random.split(rng)
+      unstructured_block = random.normal(rng_input,
+                                         (self.nb_columns, self.nb_columns))
+      q, _ = jnp.linalg.qr(unstructured_block)
+      q = jnp.transpose(q)
+      block_list.append(q[0:remaining_rows])
+    final_matrix = jnp.vstack(block_list)
+
+    if self.scaling == 0:
+      multiplier = jnp.linalg.norm(
+          random.normal(self.key, (self.nb_rows, self.nb_columns)), axis=1)
+    elif self.scaling == 1:
+      multiplier = jnp.sqrt(float(self.nb_columns)) * jnp.ones((self.nb_rows))
+    else:
+      raise ValueError('Scaling must be one of {0, 1}. Was %s' % self._scaling)
+
+    return jnp.matmul(jnp.diag(multiplier), final_matrix)
+
+  def nonnegative_softmax_kernel_feature_creator(self, x, is_query):
+    """Constructs nonnegative kernel features for fast softmax attention.
+
+    Args:
+      x: input for which features are computed
+      is_query: predicate indicating whether input data corresponds to
+                queries or keys
+
+    Returns:
+      Random features for fast softmax attention.
+    """
+    if self.normalize_data:
+      # We have e^{qk^T/sqrt{d}} = e^{q_norm k_norm^T}, where
+      # w_norm = w * data_normalizer for w in {q,k}.
+      data_normalizer = 1.0 / (jnp.sqrt(jnp.sqrt(x.shape[-1])))
+    else:
+      data_normalizer = 1.0
+    ratio = 1.0 / jnp.sqrt(self.projection_matrix.shape[0])
+    # TODO(wgaj): Double-check... Should there be only one batch dimension...?
+    data_mod_shape = x.shape[0:1] + self.projection_matrix.shape
+    data_thick_random_matrix = (jnp.zeros(data_mod_shape) +
+                                self.projection_matrix)
+
+    # FYI: Original implementation with dot_general.
+    # batch_dims_t = (0,)
+    # data_dash = lax.dot_general(
+    #     data_normalizer * x,
+    #     data_thick_random_matrix,
+    #     (((x.ndim - 1,), (data_thick_random_matrix.ndim - 1,)),
+    #      (batch_dims_t, batch_dims_t)))
+
+    data_dash = jnp.einsum('Bij, Bkj -> Bik',
+                           data_normalizer * x,
+                           data_thick_random_matrix)
+    diag_data = jnp.square(x)
+    diag_data = jnp.sum(diag_data, axis=x.ndim - 1)
+    diag_data = (diag_data / 2.0) * data_normalizer * data_normalizer
+    diag_data = jnp.expand_dims(diag_data, axis=x.ndim - 1)
+
+    last_dims_t = (len(data_dash.shape) - 1,)
+    # TODO(wgaj): Hard-coding that. Is this a good idea?
+    attention_dims_t = (1,)
+    if is_query:
+      data_dash = ratio * (
+          jnp.exp(data_dash - diag_data -
+                  jnp.max(data_dash, axis=last_dims_t, keepdims=True)) +
+          self.eps)
+    else:
+      data_dash = ratio * (
+          jnp.exp(data_dash - diag_data - jnp.max(
+              data_dash, axis=last_dims_t + attention_dims_t, keepdims=True)) +
+          self.eps)
+
+    return data_dash
+
+
 class FavorAttention(base.Layer):
   """Implements FAVOR+ attention.
 
@@ -754,13 +866,31 @@ class FavorAttention(base.Layer):
 
     n_heads: Number of attention heads.
     numerical_stabilizer: float, small number used for numerical stability.
+    use_approximate_softmax: Bool, if True uses approximate softmax, otherwise
+                             Relu.
+    nb_rows: Number of rows for the orthogonal random matrix.
+    nb_columns: Number of columns for the orthogonal random matrix.
+    scaling: Scaling attribute, 0 or 1, for generation of orthogonal random
+             matrix.
+    normalize_data: predicate indicating whether data should be normalized.
+    eps: numerical stabilizer.
     mode: One of `'train'`, `'eval'`, or `'predict'`.
   """
 
-  def __init__(self, n_heads=1, numerical_stabilizer=0.001, mode='train'):
+  def __init__(self, n_heads=1, numerical_stabilizer=0.001,
+               use_approximate_softmax=False, nb_rows=256,
+               nb_columns=0, scaling=0, normalize_data=False, eps=0.0001,
+               mode='train'):
     super().__init__(n_in=4, n_out=2)
     self.n_heads = n_heads
     self.numerical_stabilizer = numerical_stabilizer
+    self.use_approximate_softmax = use_approximate_softmax
+    if self.use_approximate_softmax:
+      self.feature_creator = NonnegativeSoftmaxKernelFeatureCreator(
+          nb_rows=nb_rows, nb_columns=nb_columns, scaling=scaling,
+          normalize_data=normalize_data, eps=eps)
+    else:
+      self.feature_creator = None
     self.mode = mode
 
   @staticmethod
@@ -780,8 +910,14 @@ class FavorAttention(base.Layer):
 
   def forward(self, inputs):
     query, key, value, mask = inputs
-    query_prime = self.relu(query) + self.numerical_stabilizer
-    key_prime = self.relu(key) + self.numerical_stabilizer
+    if self.use_approximate_softmax:
+      query_prime = (self.feature_creator.
+                     nonnegative_softmax_kernel_feature_creator(query, True))
+      key_prime = (self.feature_creator.
+                   nonnegative_softmax_kernel_feature_creator(key, False))
+    else:
+      query_prime = self.relu(query) + self.numerical_stabilizer
+      key_prime = self.relu(key) + self.numerical_stabilizer
     mask_batch_1_length = jnp.reshape(
         mask, [key.shape[0] // self.n_heads, 1, key.shape[1]]).astype(
             jnp.float32)
@@ -802,7 +938,9 @@ class FavorAttention(base.Layer):
 
 
 def Favor(d_feature, n_heads=1, dropout=0.0,
-          numerical_stabilizer=0.001, mode='train'):
+          numerical_stabilizer=0.001, use_approximate_softmax=False,
+          nb_rows=256, nb_columns=0, scaling=0, normalize_data=False,
+          eps=0.0001, mode='train'):
   """Returns a layer that maps (activations, mask) to (new_activations, mask).
 
   See the FAVOR paper for details: https://arxiv.org/abs/2006.03555
@@ -813,6 +951,14 @@ def Favor(d_feature, n_heads=1, dropout=0.0,
     dropout: Probababilistic rate for internal dropout applied to attention
         activations (based on query-key pairs) before dotting them with values.
     numerical_stabilizer: float, small number used for numerical stability.
+    use_approximate_softmax: Bool, if True uses approximate softmax, otherwise
+                             Relu.
+    nb_rows: Number of rows for the orthogonal random matrix.
+    nb_columns: Number of columns for the orthogonal random matrix.
+    scaling: Scaling attribute, 0 or 1, for generation of orthogonal random
+             matrix.
+    normalize_data: predicate indicating whether data should be normalized.
+    eps: numerical stabilizer.
     mode: One of `'train'`, `'eval'`, or `'predict'`.
   """
   del dropout  # not implemented yet but needed in the API
@@ -820,7 +966,10 @@ def Favor(d_feature, n_heads=1, dropout=0.0,
   return  tl.ConfigurableAttention(
       tl.Dense(d_feature), tl.Dense(d_feature), tl.Dense(d_feature),
       tl.Dense(d_feature),
-      tl.FavorAttention(n_heads, numerical_stabilizer, mode), n_heads=n_heads)
+      tl.FavorAttention(n_heads, numerical_stabilizer,
+                        use_approximate_softmax,
+                        nb_rows, nb_columns, scaling, normalize_data,
+                        eps, mode), n_heads=n_heads)
 
 
 class CausalFavorAttention(base.Layer):
